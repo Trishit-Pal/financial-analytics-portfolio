@@ -2,31 +2,41 @@
 portfolio_dashboard.py
 
 Institutional portfolio analytics dashboard with:
-- Multi-symbol selection (persisted with st.session_state, max 10 symbols)
-- 10-year date range analysis
-- Performance & risk KPIs:
-  - Total Return, Annualized Return, Volatility, Sharpe Ratio
-  - Alpha, Beta, VaR(95%), Max Drawdown
-  - Fundamentals (P/E, EPS, Dividend Yield, Market Cap) when available
-- Dynamic Top N / Top 5 gainers & losers tables based on number of selections
-- Robust chart saving (silent fail) to outputs/charts with title + timestamp
+- Multi-symbol selection with proper reactivity
+- Persistent filters via URL query parameters (survive browser refresh)
+- Dynamic portfolio-level KPIs (return, volatility, Sharpe, beta, alpha, VaR)
+- Top gainers/losers within the filtered universe
+- Risk metrics table and correlation heatmap
+- Matplotlib-based charts saved as .png on each page render
 """
 
 import os
+import sys
 from datetime import datetime, timedelta
+from urllib.parse import parse_qs
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
+import matplotlib.pyplot as plt
 import streamlit as st
 
-import sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from scripts import portfolio_analytics as pa
+# Optional: plotly is still imported if you want to extend later
+import plotly.graph_objects as go  # noqa: F401
 
-CHARTS_DIR = "outputs/charts"
+# Make scripts importable
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from scripts import portfolio_analytics as pa  # noqa: E402
+
+# -----------------------------------------------------------------------------
+# Paths
+# -----------------------------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CHARTS_DIR = os.path.join(BASE_DIR, "outputs", "charts")
 os.makedirs(CHARTS_DIR, exist_ok=True)
 
+# -----------------------------------------------------------------------------
+# Streamlit page config & basic styling
+# -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="Institutional Portfolio Analytics",
     page_icon="📈",
@@ -34,20 +44,218 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Minimal CSS hook (extend as needed)
+st.markdown(
+    """
+    <style>
+    .block-container { padding-top: 1rem; padding-bottom: 1rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-def save_plotly_fig(fig, title: str):
-    """Try to save Plotly figure as PNG; skip silently if image export is unavailable."""
-    safe_title = "".join(c if c.isalnum() or c in " _-" else "_" for c in title)
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename = f"{safe_title} {timestamp}.png"
-    path = os.path.join(CHARTS_DIR, filename)
+# -----------------------------------------------------------------------------
+# Helper: query param persistence
+# -----------------------------------------------------------------------------
+def get_query_params():
+    """Return current query params as a dict of lists."""
+    # st.query_params in recent Streamlit; fallback using script run context if needed
     try:
-        fig.write_image(path)
+        return st.query_params
     except Exception:
-        # If kaleido or image export fails, ignore and continue
+        # Fallback: parse from environment if available (very defensive)
+        return parse_qs("")
+
+
+def sync_query_params(selected_symbols, start_date, end_date):
+    """Write selected filters into URL query params to persist across refresh."""
+    try:
+        st.query_params.update(
+            {
+                "symbols": ",".join(selected_symbols),
+                "start": start_date.strftime("%Y-%m-%d"),
+                "end": end_date.strftime("%Y-%m-%d"),
+            }
+        )
+    except Exception:
+        # If not supported, silently ignore; state still lives in session_state
         pass
 
 
+def load_state_from_query(df: pd.DataFrame):
+    """Initialize symbols and dates from URL query params, with safe fallbacks."""
+    params = get_query_params()
+    all_symbols = sorted(df["symbol"].unique().tolist())
+
+    # Symbols
+    symbols_param = ""
+    if isinstance(params, dict) and "symbols" in params:
+        # st.query_params returns a dict-like, values are str or list-like
+        val = params.get("symbols")
+        symbols_param = val[0] if isinstance(val, list) else str(val)
+    if symbols_param:
+        selected_symbols = [s for s in symbols_param.split(",") if s in all_symbols]
+    else:
+        selected_symbols = all_symbols[:3] if len(all_symbols) >= 3 else all_symbols
+
+    # Dates
+    min_date = df["date"].min().date()
+    max_date = df["date"].max().date()
+    default_start = max_date - timedelta(days=365 * 5)
+
+    def _get_param(key, default_str):
+        if isinstance(params, dict) and key in params:
+            val = params.get(key)
+            val = val[0] if isinstance(val, list) else str(val)
+            return val or default_str
+        return default_str
+
+    start_str = _get_param("start", default_start.strftime("%Y-%m-%d"))
+    end_str = _get_param("end", max_date.strftime("%Y-%m-%d"))
+
+    try:
+        start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
+    except ValueError:
+        start_date = default_start
+
+    try:
+        end_date = datetime.strptime(end_str, "%Y-%m-%d").date()
+    except ValueError:
+        end_date = max_date
+
+    # Clamp to valid range
+    start_date = max(min_date, min(start_date, max_date))
+    end_date = max(min_date, min(end_date, max_date))
+
+    return selected_symbols, start_date, end_date
+
+
+# -----------------------------------------------------------------------------
+# Matplotlib-based savers
+# -----------------------------------------------------------------------------
+def _safe_filename(title: str) -> str:
+    safe_title = "".join(c if c.isalnum() or c in " _-" else "_" for c in title)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    return f"{safe_title} {timestamp}.png"
+
+
+def save_price_trends_image(
+    df_filtered: pd.DataFrame, selected_symbols: list[str], title: str
+):
+    """Save normalized price trends as PNG."""
+    if df_filtered.empty or not selected_symbols:
+        return
+    path = os.path.join(CHARTS_DIR, _safe_filename(title))
+    try:
+        plt.figure(figsize=(12, 5))
+        for symbol in selected_symbols:
+            sym_data = df_filtered[df_filtered["symbol"] == symbol].sort_values("date")
+            if not sym_data.empty:
+                first_price = sym_data["adjusted_close"].iloc[0]
+                normalized = sym_data["adjusted_close"] / first_price * 100
+                plt.plot(sym_data["date"], normalized, label=symbol, linewidth=2)
+        plt.title(title, fontsize=14, fontweight="bold")
+        plt.xlabel("Date")
+        plt.ylabel("Normalized Price (base=100)")
+        plt.legend(loc="best")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(path, dpi=150)
+        plt.close()
+    except Exception:
+        plt.close()
+
+
+def save_cumulative_returns_image(
+    df_filtered: pd.DataFrame, selected_symbols: list[str], title: str
+):
+    """Save cumulative returns as PNG."""
+    if df_filtered.empty or not selected_symbols:
+        return
+    path = os.path.join(CHARTS_DIR, _safe_filename(title))
+    try:
+        plt.figure(figsize=(12, 5))
+        for symbol in selected_symbols:
+            sym_data = df_filtered[df_filtered["symbol"] == symbol].sort_values("date")
+            if not sym_data.empty:
+                returns = sym_data["adjusted_close"].pct_change()
+                cum_returns = (1 + returns).cumprod() - 1
+                plt.plot(sym_data["date"], cum_returns * 100, label=symbol, linewidth=2)
+        plt.title(title, fontsize=14, fontweight="bold")
+        plt.xlabel("Date")
+        plt.ylabel("Cumulative Return (%)")
+        plt.legend(loc="best")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(path, dpi=150)
+        plt.close()
+    except Exception:
+        plt.close()
+
+
+def save_risk_heatmap_image(risk_df: pd.DataFrame, title: str):
+    """Save risk metrics heatmap as PNG."""
+    if risk_df.empty:
+        return
+    path = os.path.join(CHARTS_DIR, _safe_filename(title))
+    try:
+        metrics = ["Annual Return", "Volatility", "Sharpe", "Max DD"]
+        data = risk_df[metrics].copy()
+        data["Annual Return"] *= 100
+        data["Volatility"] *= 100
+        data["Max DD"] *= 100
+
+        plt.figure(figsize=(max(10, 0.8 * len(risk_df)), 5))
+        im = plt.imshow(data.T.values, aspect="auto", cmap="RdYlGn")
+        plt.colorbar(im, label="Value")
+        plt.yticks(
+            range(len(metrics)),
+            ["Annual Return (%)", "Volatility (%)", "Sharpe", "Max DD (%)"],
+        )
+        plt.xticks(
+            range(len(risk_df["Symbol"])),
+            risk_df["Symbol"],
+            rotation=45,
+            ha="right",
+        )
+        plt.title(title, fontsize=14, fontweight="bold")
+        plt.tight_layout()
+        plt.savefig(path, dpi=150)
+        plt.close()
+    except Exception:
+        plt.close()
+
+
+def save_rolling_vol_image(
+    df_filtered: pd.DataFrame, selected_symbols: list[str], title: str
+):
+    """Save rolling 20-day volatility as PNG."""
+    if df_filtered.empty or not selected_symbols:
+        return
+    path = os.path.join(CHARTS_DIR, _safe_filename(title))
+    try:
+        plt.figure(figsize=(12, 5))
+        for symbol in selected_symbols:
+            sym_data = df_filtered[df_filtered["symbol"] == symbol].sort_values("date")
+            if not sym_data.empty and len(sym_data) > 20:
+                returns = sym_data["adjusted_close"].pct_change()
+                rolling_vol = returns.rolling(20).std() * np.sqrt(252)
+                plt.plot(sym_data["date"], rolling_vol * 100, label=symbol, linewidth=2)
+        plt.title(title, fontsize=14, fontweight="bold")
+        plt.xlabel("Date")
+        plt.ylabel("Annualized Volatility (%)")
+        plt.legend(loc="best")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(path, dpi=150)
+        plt.close()
+    except Exception:
+        plt.close()
+
+
+# -----------------------------------------------------------------------------
+# Data loading
+# -----------------------------------------------------------------------------
 @st.cache_data(ttl=3600)
 def load_data():
     return pa.load_portfolio_data()
@@ -55,59 +263,58 @@ def load_data():
 
 df = load_data()
 
-# ---------------- Sidebar: symbol selection with persistence ---------------- #
+# -----------------------------------------------------------------------------
+# Sidebar: filters with URL-based persistence
+# -----------------------------------------------------------------------------
+saved_symbols, saved_start, saved_end = load_state_from_query(df)
 
 st.sidebar.title("📊 Configuration")
+st.sidebar.markdown("---")
 
 all_symbols = sorted(df["symbol"].unique().tolist())
-
-# Initialize session state for selections
-if "selected_symbols" not in st.session_state:
-    st.session_state.selected_symbols = all_symbols[:5] if len(all_symbols) >= 5 else all_symbols
-
-# Multiselect with persisted default
 selected_symbols = st.sidebar.multiselect(
-    "Select up to 10 symbols",
+    "📌 Select companies (up to 10)",
     all_symbols,
-    default=st.session_state.selected_symbols,
+    default=saved_symbols,
+    help="Choose stocks to analyze. Metrics update automatically.",
 )
-
-# Enforce max 10 symbols
 if len(selected_symbols) > 10:
-    st.sidebar.warning("Maximum number of companies that can be selected at a single time is 10.")
+    st.sidebar.warning("⚠️ Maximum 10 companies allowed. Showing first 10.")
     selected_symbols = selected_symbols[:10]
 
-# Update session state
-st.session_state.selected_symbols = selected_symbols
-
 if not selected_symbols:
-    st.warning("Please select at least one symbol.")
+    st.warning("⚠️ Please select at least one stock to begin analysis.")
     st.stop()
 
-# ---------------- Sidebar: date range ---------------- #
+st.sidebar.markdown("---")
+st.sidebar.subheader("📅 Analysis Period")
 
-st.sidebar.subheader("Date range")
 min_date = df["date"].min().date()
 max_date = df["date"].max().date()
-default_start = max_date - timedelta(days=365 * 5)
-
-start_date = st.sidebar.date_input(
-    "Start date",
-    default_start,
-    min_value=min_date,
-    max_value=max_date,
-)
-end_date = st.sidebar.date_input(
-    "End date",
-    max_date,
-    min_value=min_date,
-    max_value=max_date,
-)
+col_start, col_end = st.sidebar.columns(2)
+with col_start:
+    start_date = st.date_input(
+        "From",
+        saved_start,
+        min_value=min_date,
+        max_value=max_date,
+    )
+with col_end:
+    end_date = st.date_input(
+        "To",
+        saved_end,
+        min_value=min_date,
+        max_value=max_date,
+    )
 
 if start_date > end_date:
-    st.sidebar.error("Start date must be before end date.")
+    st.sidebar.error("❌ Start date must be before end date.")
     st.stop()
 
+# Sync filters into URL so refresh keeps them
+sync_query_params(selected_symbols, start_date, end_date)
+
+# Filtered data
 df_filtered = df[
     (df["date"].dt.date >= start_date)
     & (df["date"].dt.date <= end_date)
@@ -115,277 +322,278 @@ df_filtered = df[
 ].copy()
 
 if df_filtered.empty:
-    st.error("No data for selected symbols and date range.")
+    st.error("❌ No data available for selected symbols and date range.")
     st.stop()
 
-num_selected = len(selected_symbols)
-
-st.title("💼 Institutional Portfolio Analytics")
-st.caption(f"Analysis from {start_date} to {end_date} | {num_selected} symbols")
-
-# ---------------- Portfolio KPIs ---------------- #
-
-st.header("Key Performance Indicators")
-
-portfolio_metrics = pa.calculate_portfolio_metrics(
-    df_filtered, start_date=str(start_date), end_date=str(end_date)
+# -----------------------------------------------------------------------------
+# Portfolio-level KPIs (real-time)
+# -----------------------------------------------------------------------------
+metrics = pa.calculate_portfolio_metrics(
+    df[
+        (df["symbol"].isin(selected_symbols))
+        & (df["date"].dt.date >= start_date)
+        & (df["date"].dt.date <= end_date)
+    ]
 )
 
-# Compute benchmark returns if available for alpha/beta use in gainers/losers
-BENCH = pa.BENCHMARK_SYMBOL
-bench_df = df_filtered[df_filtered["symbol"] == BENCH].sort_values("date")
-benchmark_returns = None
-if not bench_df.empty and len(bench_df) > 1:
-    bp = bench_df["adjusted_close"].values
-    b_ret = np.diff(bp) / bp[:-1]
-    benchmark_returns = pd.Series(b_ret, index=bench_df["date"].iloc[1:])
+total_return = metrics["total_return"]
+annualized_return = metrics["annualized_return"]
+volatility = metrics["volatility"]
+sharpe_ratio = metrics["sharpe_ratio"]
+beta = metrics.get("beta")
+alpha = metrics.get("alpha")
+var_95 = metrics.get("var_95")
+num_symbols = metrics["num_symbols"]
 
-# Top movers; dynamic N based on selections
-top_n = num_selected if num_selected < 5 else 5
+st.markdown(
+    f"📊 Analyzing **{num_symbols}** "
+    f"{'stock' if num_symbols == 1 else 'stocks'} "
+    f"from **{start_date}** to **{end_date}**"
+)
+
+kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+with kpi1:
+    st.metric("Total Return", f"{total_return * 100:,.2f} %")
+with kpi2:
+    st.metric("Annualized Return", f"{annualized_return * 100:,.2f} %")
+with kpi3:
+    st.metric("Volatility (ann.)", f"{volatility * 100:,.2f} %")
+with kpi4:
+    st.metric("Sharpe Ratio", f"{sharpe_ratio:,.2f}")
+
+kpi5, kpi6, kpi7 = st.columns(3)
+with kpi5:
+    st.metric("Portfolio Beta", f"{beta:,.2f}" if beta is not None else "N/A")
+with kpi6:
+    st.metric(
+        "Jensen's Alpha",
+        f"{alpha * 100:,.2f} %" if alpha is not None else "N/A",
+    )
+with kpi7:
+    st.metric(
+        "95% VaR (daily)",
+        f"{var_95 * 100:,.2f} %" if var_95 is not None else "N/A",
+    )
+
+# -----------------------------------------------------------------------------
+# Top gainers / losers within filtered symbols
+# -----------------------------------------------------------------------------
+bench_df = df[df["symbol"] == pa.BENCHMARK_SYMBOL].copy()
+benchmark_returns = None
+if not bench_df.empty:
+    bench_df = bench_df.sort_values("date")
+    bench_df = bench_df[
+        (bench_df["date"].dt.date >= start_date)
+        & (bench_df["date"].dt.date <= end_date)
+    ]
+    if len(bench_df) > 1:
+        bench_prices = bench_df["adjusted_close"].values
+        b_ret = np.diff(bench_prices) / bench_prices[:-1]
+        benchmark_returns = pd.Series(b_ret, index=bench_df["date"].iloc[1:])
+
 gainers, losers = pa.get_top_gainers_losers(
-    df_filtered,
-    "total_return",
-    n=top_n,
-    start_date=str(start_date),
-    end_date=str(end_date),
+    df[df["symbol"].isin(selected_symbols)],
+    metric="total_return",
+    n=5,
+    start_date=start_date.strftime("%Y-%m-%d"),
+    end_date=end_date.strftime("%Y-%m-%d"),
     benchmark_returns=benchmark_returns,
 )
 
-kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
-
-with kpi1:
-    st.metric(
-        "Total Return",
-        f"{portfolio_metrics['total_return'] * 100:.2f}%",
-        delta=f"{portfolio_metrics['annualized_return'] * 100:.2f}% annualized",
-    )
-
-with kpi2:
-    st.metric(
-        "Volatility (Ann.)",
-        f"{portfolio_metrics['volatility'] * 100:.2f}%",
-    )
-
-with kpi3:
-    sharpe = portfolio_metrics.get("sharpe_ratio", 0.0)
-    st.metric("Sharpe Ratio", f"{sharpe:.2f}")
-
-with kpi4:
-    beta_val = portfolio_metrics.get("beta")
-    st.metric("Portfolio Beta (vs SPY)", f"{beta_val:.2f}" if beta_val is not None else "N/A")
-
-with kpi5:
-    alpha_val = portfolio_metrics.get("alpha")
-    st.metric("Portfolio Alpha", f"{alpha_val:.2f}" if alpha_val is not None else "N/A")
-
-kpi6, kpi7, kpi8, kpi9, kpi10 = st.columns(5)
-
-with kpi6:
-    var_val = portfolio_metrics.get("var_95")
-    st.metric("VaR 95% (daily)", f"{var_val * 100:.2f}%" if var_val is not None else "N/A")
-
-# Fundamentals (from first selected symbol, if available)
-first_symbol = selected_symbols[0]
-fund = pa.get_fundamentals(first_symbol)
-
-with kpi7:
-    pe = fund.get("pe_ratio")
-    st.metric(f"{first_symbol} P/E", f"{pe:.2f}" if pe is not None else "N/A")
-
-with kpi8:
-    eps = fund.get("eps")
-    st.metric(f"{first_symbol} EPS", f"{eps:.2f}" if eps is not None else "N/A")
-
-with kpi9:
-    dy = fund.get("dividend_yield")
-    st.metric(
-        f"{first_symbol} Dividend Yield",
-        f"{dy * 100:.2f}%" if dy is not None else "N/A",
-    )
-
-with kpi10:
-    mc = fund.get("market_cap")
-    st.metric(
-        f"{first_symbol} Market Cap",
-        f"{mc/1e9:.2f} B" if mc is not None else "N/A",
-    )
-
-st.markdown("---")
-
-# ---------------- Charts row 1: Price Trends & Cumulative Returns ---------------- #
-
-col1, col2 = st.columns(2)
-
-with col1:
-    st.subheader("Price Trends (Normalized to 100)")
-    fig_price = go.Figure()
-    for symbol in selected_symbols:
-        sym_data = df_filtered[df_filtered["symbol"] == symbol].sort_values("date")
-        if not sym_data.empty:
-            first_price = sym_data["adjusted_close"].iloc[0]
-            normalized = sym_data["adjusted_close"] / first_price * 100
-            fig_price.add_trace(
-                go.Scatter(
-                    x=sym_data["date"],
-                    y=normalized,
-                    name=symbol,
-                    mode="lines",
-                )
+top1, top2 = st.columns(2)
+with top1:
+    st.subheader("Top 5 Gainers")
+    if not gainers.empty:
+        st.dataframe(
+            gainers[["symbol", "total_return", "sharpe_ratio", "volatility"]]
+            .rename(
+                columns={
+                    "symbol": "Symbol",
+                    "total_return": "Total Return",
+                    "sharpe_ratio": "Sharpe",
+                    "volatility": "Volatility",
+                }
             )
-    fig_price.update_layout(
-        height=400,
-        xaxis_title="Date",
-        yaxis_title="Normalized Price (base=100)",
-        hovermode="x unified",
-    )
-    st.plotly_chart(fig_price, use_container_width=True)
-    save_plotly_fig(fig_price, "Price Trends (Normalized to 100)")
-
-with col2:
-    st.subheader("Cumulative Returns")
-    fig_cum = go.Figure()
-    for symbol in selected_symbols:
-        sym_data = df_filtered[df_filtered["symbol"] == symbol].sort_values("date")
-        if not sym_data.empty:
-            returns = sym_data["adjusted_close"].pct_change()
-            cum_returns = (1 + returns).cumprod() - 1
-            fig_cum.add_trace(
-                go.Scatter(
-                    x=sym_data["date"],
-                    y=cum_returns * 100,
-                    name=symbol,
-                    mode="lines",
-                )
+            .assign(
+                **{
+                    "Total Return": gainers["total_return"] * 100,
+                    "Volatility": gainers["volatility"] * 100,
+                }
             )
-    fig_cum.update_layout(
-        height=400,
-        xaxis_title="Date",
-        yaxis_title="Cumulative Return (%)",
-        hovermode="x unified",
-    )
-    st.plotly_chart(fig_cum, use_container_width=True)
-    save_plotly_fig(fig_cum, "Cumulative Returns")
+            .style.format(
+                {
+                    "Total Return": "{:.2f} %",
+                    "Volatility": "{:.2f} %",
+                    "Sharpe": "{:.2f}",
+                }
+            )
+        )
+    else:
+        st.write("No data.")
+with top2:
+    st.subheader("Top 5 Losers")
+    if not losers.empty:
+        st.dataframe(
+            losers[["symbol", "total_return", "sharpe_ratio", "volatility"]]
+            .rename(
+                columns={
+                    "symbol": "Symbol",
+                    "total_return": "Total Return",
+                    "sharpe_ratio": "Sharpe",
+                    "volatility": "Volatility",
+                }
+            )
+            .assign(
+                **{
+                    "Total Return": losers["total_return"] * 100,
+                    "Volatility": losers["volatility"] * 100,
+                }
+            )
+            .style.format(
+                {
+                    "Total Return": "{:.2f} %",
+                    "Volatility": "{:.2f} %",
+                    "Sharpe": "{:.2f}",
+                }
+            )
+        )
+    else:
+        st.write("No data.")
 
-st.markdown("---")
-
-# ---------------- Risk Metrics Heatmap ---------------- #
-
-st.subheader("Risk Metrics Heatmap")
-
+# -----------------------------------------------------------------------------
+# Risk metrics by symbol
+# -----------------------------------------------------------------------------
 risk_rows = []
-for symbol in selected_symbols:
-    result = pa.get_period_returns(
-        df_filtered,
-        symbol,
-        start_date=str(start_date),
-        end_date=str(end_date),
-        benchmark_returns=benchmark_returns,
+for sym in selected_symbols:
+    sym_df = df_filtered[df_filtered["symbol"] == sym].sort_values("date")
+    if len(sym_df) < 2:
+        continue
+    prices = sym_df["adjusted_close"].values
+    rets = sym_df["adjusted_close"].pct_change().dropna()
+    num_days = (sym_df["date"].max() - sym_df["date"].min()).days
+    ann_ret = pa.calculate_annualized_return(pd.Series(prices), num_days)
+    vol = pa.calculate_volatility(rets)
+    sharpe = pa.calculate_sharpe_ratio(rets)
+    max_dd, _, _ = pa.calculate_max_drawdown(pd.Series(prices))
+    risk_rows.append(
+        {
+            "Symbol": sym,
+            "Annual Return": ann_ret,
+            "Volatility": vol,
+            "Sharpe": sharpe,
+            "Max DD": max_dd,
+        }
     )
-    if result:
-        risk_rows.append({
-            "Symbol": symbol,
-            "Annual Return": result["annualized_return"],
-            "Volatility": result["volatility"],
-            "Sharpe": result["sharpe_ratio"],
-            "Max DD": result["max_drawdown"],
-        })
 
 risk_df = pd.DataFrame(risk_rows)
-
 if not risk_df.empty:
-    fig_heatmap = go.Figure(
-        data=go.Heatmap(
-            z=risk_df[["Annual Return", "Volatility", "Sharpe", "Max DD"]].T.values * 100,
-            x=risk_df["Symbol"],
-            y=["Annual Return (%)", "Volatility (%)", "Sharpe Ratio", "Max DD (%)"],
-            colorscale="RdYlGn",
-            colorbar=dict(title="Value"),
+    st.subheader("Risk Metrics by Symbol")
+    st.dataframe(
+        risk_df.assign(
+            **{
+                "Annual Return": risk_df["Annual Return"] * 100,
+                "Volatility": risk_df["Volatility"] * 100,
+                "Max DD": risk_df["Max DD"] * 100,
+            }
+        ).style.format(
+            {
+                "Annual Return": "{:.2f} %",
+                "Volatility": "{:.2f} %",
+                "Sharpe": "{:.2f}",
+                "Max DD": "{:.2f} %",
+            }
         )
     )
-    fig_heatmap.update_layout(height=300)
-    st.plotly_chart(fig_heatmap, use_container_width=True)
-    save_plotly_fig(fig_heatmap, "Risk Metrics Heatmap")
-else:
-    st.write("Not enough data to compute risk metrics.")
+    # Save risk heatmap PNG (created on each render/refresh)
+    save_risk_heatmap_image(risk_df, "Risk metrics heatmap")
 
-st.markdown("---")
+# -----------------------------------------------------------------------------
+# Time-series Matplotlib charts (and PNG saving)
+# -----------------------------------------------------------------------------
+# Normalized price trends
+st.subheader("Normalized Price Trends (base = 100)")
+price_title = "Normalized price trends"
+save_price_trends_image(df_filtered, selected_symbols, price_title)
 
-# ---------------- Top movers with dynamic N ---------------- #
-
-col3, col4 = st.columns(2)
-label_suffix = f"Top {top_n}" if num_selected >= 5 else f"Top {num_selected}"
-
-with col3:
-    st.subheader(f"🔝 {label_suffix} Gainers")
-    if not gainers.empty:
-        gainers_display = gainers[
-            ["symbol", "total_return", "annualized_return", "sharpe_ratio", "volatility"]
-        ].copy()
-        gainers_display.columns = ["Symbol", "Total Return", "Annual Return", "Sharpe", "Volatility"]
-        gainers_display["Total Return"] *= 100
-        gainers_display["Annual Return"] *= 100
-        gainers_display["Volatility"] *= 100
-        st.dataframe(gainers_display, use_container_width=True)
-    else:
-        st.write("No data.")
-
-with col4:
-    st.subheader(f"🔽 {label_suffix} Losers")
-    if not losers.empty:
-        losers_display = losers[
-            ["symbol", "total_return", "annualized_return", "sharpe_ratio", "volatility"]
-        ].copy()
-        losers_display.columns = ["Symbol", "Total Return", "Annual Return", "Sharpe", "Volatility"]
-        losers_display["Total Return"] *= 100
-        losers_display["Annual Return"] *= 100
-        losers_display["Volatility"] *= 100
-        st.dataframe(losers_display, use_container_width=True)
-    else:
-        st.write("No data.")
-
-st.markdown("---")
-
-# ---------------- Rolling Volatility ---------------- #
-
-st.subheader("Rolling 20-Day Volatility")
-fig_vol = go.Figure()
+fig_price, ax_price = plt.subplots(figsize=(12, 5))
 for symbol in selected_symbols:
     sym_data = df_filtered[df_filtered["symbol"] == symbol].sort_values("date")
     if not sym_data.empty:
-        returns = sym_data["adjusted_close"].pct_change()
-        rolling_vol = returns.rolling(20).std() * np.sqrt(252)
-        fig_vol.add_trace(
-            go.Scatter(
-                x=sym_data["date"],
-                y=rolling_vol * 100,
-                name=symbol,
-                mode="lines",
-            )
-        )
-fig_vol.update_layout(
-    height=400,
-    xaxis_title="Date",
-    yaxis_title="Annualized Volatility (%)",
-    hovermode="x unified",
+        first_price = sym_data["adjusted_close"].iloc[0]
+        normalized = sym_data["adjusted_close"] / first_price * 100
+        ax_price.plot(sym_data["date"], normalized, label=symbol, linewidth=2)
+ax_price.set_title(price_title)
+ax_price.set_xlabel("Date")
+ax_price.set_ylabel("Normalized Price (base=100)")
+ax_price.legend(loc="best")
+ax_price.grid(alpha=0.3)
+st.pyplot(fig_price)
+plt.close(fig_price)
+
+# Cumulative returns
+st.subheader("Cumulative Returns")
+cum_title = "Cumulative returns"
+save_cumulative_returns_image(df_filtered, selected_symbols, cum_title)
+
+fig_cum, ax_cum = plt.subplots(figsize=(12, 5))
+for symbol in selected_symbols:
+    sym_data = df_filtered[df_filtered["symbol"] == symbol].sort_values("date")
+    if not sym_data.empty:
+        rets = sym_data["adjusted_close"].pct_change()
+        cum_ret = (1 + rets).cumprod() - 1
+        ax_cum.plot(sym_data["date"], cum_ret * 100, label=symbol, linewidth=2)
+ax_cum.set_title(cum_title)
+ax_cum.set_xlabel("Date")
+ax_cum.set_ylabel("Cumulative Return (%)")
+ax_cum.legend(loc="best")
+ax_cum.grid(alpha=0.3)
+st.pyplot(fig_cum)
+plt.close(fig_cum)
+
+# Rolling 20-day volatility
+st.subheader("Rolling 20-day Volatility")
+vol_title = "Rolling 20-day volatility"
+save_rolling_vol_image(df_filtered, selected_symbols, vol_title)
+
+fig_vol, ax_vol = plt.subplots(figsize=(12, 5))
+for symbol in selected_symbols:
+    sym_data = df_filtered[df_filtered["symbol"] == symbol].sort_values("date")
+    if not sym_data.empty and len(sym_data) > 20:
+        rets = sym_data["adjusted_close"].pct_change()
+        rolling_vol = rets.rolling(20).std() * np.sqrt(252) * 100
+        ax_vol.plot(sym_data["date"], rolling_vol, label=symbol, linewidth=2)
+ax_vol.set_title(vol_title)
+ax_vol.set_xlabel("Date")
+ax_vol.set_ylabel("Annualized Volatility (%)")
+ax_vol.legend(loc="best")
+ax_vol.grid(alpha=0.3)
+st.pyplot(fig_vol)
+plt.close(fig_vol)
+
+# -----------------------------------------------------------------------------
+# Correlation heatmap
+# -----------------------------------------------------------------------------
+st.subheader("Return Correlation Heatmap")
+corr_df = (
+    df_filtered.pivot(index="date", columns="symbol", values="adjusted_close")
+    .pct_change()
+    .corr()
 )
-st.plotly_chart(fig_vol, use_container_width=True)
-save_plotly_fig(fig_vol, "Rolling 20-Day Volatility")
+if corr_df.shape[0] > 1:
+    fig_corr, ax_corr = plt.subplots(
+        figsize=(0.8 * corr_df.shape[0], 0.8 * corr_df.shape[0])
+    )
+    im = ax_corr.imshow(corr_df.values, cmap="RdBu_r", vmin=-1, vmax=1)
+    ax_corr.set_xticks(range(len(corr_df.columns)))
+    ax_corr.set_yticks(range(len(corr_df.columns)))
+    ax_corr.set_xticklabels(corr_df.columns, rotation=45, ha="right")
+    ax_corr.set_yticklabels(corr_df.columns)
+    plt.colorbar(im, ax=ax_corr, label="Correlation")
+    plt.tight_layout()
+    st.pyplot(fig_corr)
 
-st.markdown("---")
-
-# ---------------- Detailed Risk Metrics Table ---------------- #
-
-st.subheader("Detailed Risk Metrics Table")
-if not risk_df.empty:
-    risk_df_display = risk_df.copy()
-    risk_df_display["Annual Return"] = risk_df_display["Annual Return"] * 100
-    risk_df_display["Volatility"] = risk_df_display["Volatility"] * 100
-    risk_df_display["Max DD"] = risk_df_display["Max DD"] * 100
-    st.dataframe(risk_df_display, use_container_width=True)
-
-st.caption(
-    "KPIs shown only where data is available. "
-    "Sharpe: risk-adjusted return; Beta/Alpha vs SPY; "
-    "VaR(95%): worst expected daily loss at 95% confidence; "
-    "Max Drawdown: largest peak-to-trough decline."
-)
+    corr_path = os.path.join(CHARTS_DIR, _safe_filename("Correlation heatmap"))
+    fig_corr.savefig(corr_path, dpi=150)
+    plt.close(fig_corr)
+else:
+    st.write("Not enough symbols for correlation matrix.")
